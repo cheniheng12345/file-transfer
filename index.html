@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>跨设备P2P文件传输工具</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#165DFF',
+                        success: '#00B42A',
+                        warning: '#FF7D00',
+                        danger: '#F53F3F',
+                    },
+                }
+            }
+        }
+    </script>
+    <style type="text/tailwindcss">
+        @layer utilities {
+            .content-auto {
+                content-visibility: auto;
+            }
+            .drop-area-active {
+                @apply border-primary bg-blue-50;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen font-sans">
+    <div class="container mx-auto px-4 py-8 max-w-4xl">
+        <!-- 标题区域 -->
+        <header class="text-center mb-8">
+            <h1 class="text-[clamp(1.8rem,4vw,2.5rem)] font-bold text-gray-800 mb-2">跨设备P2P文件传输</h1>
+            <p class="text-gray-500 max-w-xl mx-auto">两台设备通过浏览器直连互传文件，文件不经过第三方服务器，安全快速</p>
+        </header>
+
+        <!-- 连接状态卡片 -->
+        <div class="bg-white rounded-xl shadow-md p-6 mb-6">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-xl font-semibold text-gray-800">连接状态</h2>
+                <div id="statusBadge" class="px-3 py-1 rounded-full text-sm bg-gray-200 text-gray-600">
+                    <i class="fa fa-circle-o mr-1"></i>未连接
+                </div>
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-4">
+                <!-- 创建房间 -->
+                <div class="border border-gray-200 rounded-lg p-4">
+                    <h3 class="font-medium text-gray-700 mb-3">创建房间（作为接收方）</h3>
+                    <button id="createRoomBtn" class="w-full bg-primary hover:bg-primary/90 text-white py-2 rounded-lg transition-all">
+                        <i class="fa fa-plus mr-2"></i>生成房间号
+                    </button>
+                    <div id="roomIdContainer" class="mt-3 hidden">
+                        <p class="text-sm text-gray-500 mb-1">你的房间号（发给对方）：</p>
+                        <div class="flex">
+                            <input type="text" id="roomIdInput" readonly class="flex-1 border border-gray-300 rounded-l-lg px-3 py-2 bg-gray-50 font-mono">
+                            <button id="copyRoomBtn" class="bg-gray-200 hover:bg-gray-300 px-3 rounded-r-lg transition-all">
+                                <i class="fa fa-copy"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 加入房间 -->
+                <div class="border border-gray-200 rounded-lg p-4">
+                    <h3 class="font-medium text-gray-700 mb-3">加入房间（作为发送方）</h3>
+                    <div class="flex">
+                        <input type="text" id="joinRoomInput" placeholder="输入对方房间号" class="flex-1 border border-gray-300 rounded-l-lg px-3 py-2 font-mono">
+                        <button id="joinRoomBtn" class="bg-success hover:bg-success/90 text-white px-4 rounded-r-lg transition-all">
+                            连接
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 传输区域 -->
+        <div class="bg-white rounded-xl shadow-md p-6 mb-6">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">文件传输</h2>
+            
+            <!-- 拖拽上传区域 -->
+            <div id="dropArea" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer transition-all hover:border-primary mb-4">
+                <i class="fa fa-cloud-upload text-4xl text-gray-400 mb-3"></i>
+                <p class="text-gray-600 mb-1">拖拽文件到此处，或点击选择文件</p>
+                <p class="text-sm text-gray-400">连接成功后即可发送文件给对方</p>
+                <input type="file" id="fileInput" multiple class="hidden">
+            </div>
+
+            <!-- 传输进度列表 -->
+            <div id="transferList" class="space-y-3">
+                <div id="emptyTransfer" class="text-center py-6 text-gray-400">
+                    <i class="fa fa-exchange text-3xl mb-2"></i>
+                    <p>暂无传输任务</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 接收文件列表 -->
+        <div class="bg-white rounded-xl shadow-md p-6">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">接收的文件</h2>
+            <div id="receivedList" class="space-y-3">
+                <div id="emptyReceived" class="text-center py-6 text-gray-400">
+                    <i class="fa fa-download text-3xl mb-2"></i>
+                    <p>暂无接收的文件</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 全局变量
+        let peer = null;
+        let conn = null;
+        let currentRoomId = null;
+        let isHost = false;
+
+        // DOM 元素
+        const statusBadge = document.getElementById('statusBadge');
+        const createRoomBtn = document.getElementById('createRoomBtn');
+        const roomIdContainer = document.getElementById('roomIdContainer');
+        const roomIdInput = document.getElementById('roomIdInput');
+        const copyRoomBtn = document.getElementById('copyRoomBtn');
+        const joinRoomInput = document.getElementById('joinRoomInput');
+        const joinRoomBtn = document.getElementById('joinRoomBtn');
+        const dropArea = document.getElementById('dropArea');
+        const fileInput = document.getElementById('fileInput');
+        const transferList = document.getElementById('transferList');
+        const emptyTransfer = document.getElementById('emptyTransfer');
+        const receivedList = document.getElementById('receivedList');
+        const emptyReceived = document.getElementById('emptyReceived');
+
+        // 更新连接状态
+        function updateStatus(connected) {
+            if (connected) {
+                statusBadge.innerHTML = '<i class="fa fa-check-circle mr-1"></i>已连接';
+                statusBadge.className = 'px-3 py-1 rounded-full text-sm bg-green-100 text-green-700';
+            } else {
+                statusBadge.innerHTML = '<i class="fa fa-circle-o mr-1"></i>未连接';
+                statusBadge.className = 'px-3 py-1 rounded-full text-sm bg-gray-200 text-gray-600';
+            }
+        }
+
+        // 生成随机房间号
+        function generateRoomId() {
+            return Math.random().toString(36).substring(2, 8).toUpperCase();
+        }
+
+        // 创建房间
+        createRoomBtn.addEventListener('click', () => {
+            const roomId = generateRoomId();
+            isHost = true;
+            currentRoomId = roomId;
+            
+            peer = new Peer(roomId, {
+                debug: 2,
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                }
+            });
+
+            peer.on('open', (id) => {
+                roomIdInput.value = id;
+                roomIdContainer.classList.remove('hidden');
+                createRoomBtn.disabled = true;
+                createRoomBtn.classList.add('opacity-50', 'cursor-not-allowed');
+            });
+
+            peer.on('connection', (connection) => {
+                conn = connection;
+                setupConnection();
+            });
+
+            peer.on('error', (err) => {
+                alert('创建房间失败：' + err.type);
+                resetConnection();
+            });
+        });
+
+        // 加入房间
+        joinRoomBtn.addEventListener('click', () => {
+            const roomId = joinRoomInput.value.trim().toUpperCase();
+            if (!roomId) {
+                alert('请输入房间号');
+                return;
+            }
+
+            isHost = false;
+            currentRoomId = roomId;
+
+            peer = new Peer({
+                debug: 2,
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                }
+            });
+
+            peer.on('open', () => {
+                conn = peer.connect(roomId, {
+                    reliable: true
+                });
+                setupConnection();
+            });
+
+            peer.on('error', (err) => {
+                alert('连接失败：' + err.type + '，请检查房间号是否正确');
+                resetConnection();
+            });
+        });
+
+        // 设置连接
+        function setupConnection() {
+            conn.on('open', () => {
+                updateStatus(true);
+                alert('连接成功！现在可以开始传输文件了');
+            });
+
+            conn.on('data', (data) => {
+                handleReceivedData(data);
+            });
+
+            conn.on('close', () => {
+                updateStatus(false);
+                alert('连接已断开');
+                resetConnection();
+            });
+        }
+
+        // 重置连接
+        function resetConnection() {
+            if (peer) peer.destroy();
+            peer = null;
+            conn = null;
+            currentRoomId = null;
+            isHost = false;
+            updateStatus(false);
+            createRoomBtn.disabled = false;
+            createRoomBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            roomIdContainer.classList.add('hidden');
+            roomIdInput.value = '';
+            joinRoomInput.value = '';
+        }
+
+        // 复制房间号
+        copyRoomBtn.addEventListener('click', () => {
+            roomIdInput.select();
+            document.execCommand('copy');
+            alert('房间号已复制到剪贴板');
+        });
+
+        // 文件选择
+        dropArea.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', (e) => {
+            sendFiles(e.target.files);
+            fileInput.value = '';
+        });
+
+        // 拖拽事件
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropArea.addEventListener(eventName, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                dropArea.classList.add('drop-area-active');
+            });
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropArea.addEventListener(eventName, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                dropArea.classList.remove('drop-area-active');
+            });
+        });
+
+        dropArea.addEventListener('drop', (e) => {
+            const files = e.dataTransfer.files;
+            sendFiles(files);
+        });
+
+        // 发送文件
+        function sendFiles(files) {
+            if (!conn || !conn.open) {
+                alert('请先连接到对方设备');
+                return;
+            }
+
+            Array.from(files).forEach(file => {
+                // 创建传输任务UI
+                const transferItem = document.createElement('div');
+                transferItem.className = 'border border-gray-200 rounded-lg p-3';
+                transferItem.innerHTML = `
+                    <div class="flex items-center justify-between mb-2">
+                        <p class="text-gray-800 font-medium truncate">${file.name}</p>
+                        <span class="text-sm text-gray-500 sending-status">准备发送...</span>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-2">
+                        <div class="bg-primary h-2 rounded-full progress-bar" style="width: 0%"></div>
+                    </div>
+                `;
+                transferList.insertBefore(transferItem, emptyTransfer);
+                emptyTransfer.classList.add('hidden');
+
+                // 分块发送文件
+                const chunkSize = 16 * 1024; // 16KB 每块
+                let offset = 0;
+                const totalChunks = Math.ceil(file.size / chunkSize);
+                let currentChunk = 0;
+
+                // 发送文件元信息
+                conn.send({
+                    type: 'file-meta',
+                    name: file.name,
+                    size: file.size,
+                    totalChunks: totalChunks
+                });
+
+                function sendNextChunk() {
+                    if (offset >= file.size) {
+                        transferItem.querySelector('.sending-status').textContent = '发送完成';
+                        transferItem.querySelector('.progress-bar').style.width = '100%';
+                        return;
+                    }
+
+                    const chunk = file.slice(offset, offset + chunkSize);
+                    chunk.arrayBuffer().then(buffer => {
+                        conn.send({
+                            type: 'file-chunk',
+                            chunk: buffer,
+                            index: currentChunk
+                        });
+                        
+                        currentChunk++;
+                        offset += chunkSize;
+                        const progress = (currentChunk / totalChunks) * 100;
+                        transferItem.querySelector('.progress-bar').style.width = progress + '%';
+                        transferItem.querySelector('.sending-status').textContent = `发送中 ${Math.round(progress)}%`;
+                        
+                        setTimeout(sendNextChunk, 10);
+                    });
+                }
+
+                sendNextChunk();
+            });
+        }
+
+        // 接收数据处理
+        const receivedFiles = {};
+        function handleReceivedData(data) {
+            if (data.type === 'file-meta') {
+                // 初始化接收
+                const fileId = Date.now() + '_' + data.name;
+                receivedFiles[fileId] = {
+                    name: data.name,
+                    size: data.size,
+                    totalChunks: data.totalChunks,
+                    chunks: []
+                };
+
+                // 创建接收UI
+                const receiveItem = document.createElement('div');
+                receiveItem.className = 'border border-gray-200 rounded-lg p-3';
+                receiveItem.id = 'receive_' + fileId;
+                receiveItem.innerHTML = `
+                    <div class="flex items-center justify-between mb-2">
+                        <p class="text-gray-800 font-medium truncate">${data.name}</p>
+                        <span class="text-sm text-gray-500 receiving-status">接收中 0%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-2">
+                        <div class="bg-success h-2 rounded-full progress-bar" style="width: 0%"></div>
+                    </div>
+                `;
+                receivedList.insertBefore(receiveItem, emptyReceived);
+                emptyReceived.classList.add('hidden');
+            } else if (data.type === 'file-chunk') {
+                // 接收分块
+                const fileId = Object.keys(receivedFiles).find(id => 
+                    receivedFiles[id].chunks.length === data.index
+                );
+                if (!fileId) return;
+
+                receivedFiles[fileId].chunks.push(data.chunk);
+                const progress = (receivedFiles[fileId].chunks.length / receivedFiles[fileId].totalChunks) * 100;
+                
+                const receiveItem = document.getElementById('receive_' + fileId);
+                receiveItem.querySelector('.progress-bar').style.width = progress + '%';
+                receiveItem.querySelector('.receiving-status').textContent = `接收中 ${Math.round(progress)}%`;
+
+                // 接收完成
+                if (receivedFiles[fileId].chunks.length === receivedFiles[fileId].totalChunks) {
+                    const fileData = receivedFiles[fileId];
+                    const blob = new Blob(fileData.chunks);
+                    const url = URL.createObjectURL(blob);
+                    
+                    receiveItem.querySelector('.receiving-status').textContent = '接收完成';
+                    receiveItem.innerHTML += `
+                        <a href="${url}" download="${fileData.name}" class="mt-2 inline-block bg-success hover:bg-success/90 text-white px-4 py-1 rounded-lg text-sm transition-all">
+                            <i class="fa fa-download mr-1"></i>下载文件
+                        </a>
+                    `;
+                    delete receivedFiles[fileId];
+                }
+            }
+        }
+
+        // 初始化
+        updateStatus(false);
+    </script>
+</body>
+</html>
