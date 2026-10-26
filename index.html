@@ -23,24 +23,18 @@
     </script>
     <style type="text/tailwindcss">
         @layer utilities {
-            .content-auto {
-                content-visibility: auto;
-            }
-            .drop-area-active {
-                @apply border-primary bg-blue-50;
-            }
+            .content-auto { content-visibility: auto; }
+            .drop-area-active { @apply border-primary bg-blue-50; }
         }
     </style>
 </head>
 <body class="bg-gray-50 min-h-screen font-sans">
     <div class="container mx-auto px-4 py-8 max-w-4xl">
-        <!-- 标题区域 -->
         <header class="text-center mb-8">
             <h1 class="text-[clamp(1.8rem,4vw,2.5rem)] font-bold text-gray-800 mb-2">跨设备P2P文件传输</h1>
             <p class="text-gray-500 max-w-xl mx-auto">两台设备通过浏览器直连互传文件，文件不经过第三方服务器，安全快速</p>
         </header>
 
-        <!-- 连接状态卡片 -->
         <div class="bg-white rounded-xl shadow-md p-6 mb-6">
             <div class="flex items-center justify-between mb-4">
                 <h2 class="text-xl font-semibold text-gray-800">连接状态</h2>
@@ -49,8 +43,9 @@
                 </div>
             </div>
 
+            <div id="connInfo" class="text-sm text-gray-500 mb-3 hidden"></div>
+
             <div class="grid md:grid-cols-2 gap-4">
-                <!-- 创建房间 -->
                 <div class="border border-gray-200 rounded-lg p-4">
                     <h3 class="font-medium text-gray-700 mb-3">创建房间（作为接收方）</h3>
                     <button id="createRoomBtn" class="w-full bg-primary hover:bg-primary/90 text-white py-2 rounded-lg transition-all">
@@ -67,7 +62,6 @@
                     </div>
                 </div>
 
-                <!-- 加入房间 -->
                 <div class="border border-gray-200 rounded-lg p-4">
                     <h3 class="font-medium text-gray-700 mb-3">加入房间（作为发送方）</h3>
                     <div class="flex">
@@ -80,11 +74,8 @@
             </div>
         </div>
 
-        <!-- 传输区域 -->
         <div class="bg-white rounded-xl shadow-md p-6 mb-6">
             <h2 class="text-xl font-semibold text-gray-800 mb-4">文件传输</h2>
-            
-            <!-- 拖拽上传区域 -->
             <div id="dropArea" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer transition-all hover:border-primary mb-4">
                 <i class="fa fa-cloud-upload text-4xl text-gray-400 mb-3"></i>
                 <p class="text-gray-600 mb-1">拖拽文件到此处，或点击选择文件</p>
@@ -92,7 +83,6 @@
                 <input type="file" id="fileInput" multiple class="hidden">
             </div>
 
-            <!-- 传输进度列表 -->
             <div id="transferList" class="space-y-3">
                 <div id="emptyTransfer" class="text-center py-6 text-gray-400">
                     <i class="fa fa-exchange text-3xl mb-2"></i>
@@ -101,7 +91,6 @@
             </div>
         </div>
 
-        <!-- 接收文件列表 -->
         <div class="bg-white rounded-xl shadow-md p-6">
             <h2 class="text-xl font-semibold text-gray-800 mb-4">接收的文件</h2>
             <div id="receivedList" class="space-y-3">
@@ -114,14 +103,33 @@
     </div>
 
     <script>
-        // 全局变量
+        // ============ 可调参数 ============
+        const CHUNK_SIZE = 256 * 1024;          // 256KB 每块
+        const PARALLEL_CONNS = 4;               // 并行连接数
+        const BUFFER_HIGH = 2 * 1024 * 1024;    // 单连接缓冲高水位 2MB
+        const BUFFER_LOW  = 512 * 1024;         // 降到低水位再继续
+        const CONNECT_TIMEOUT = 15000;          // 建连超时 15 秒
+
+        // 方案三：只靠 STUN，不配 TURN。多放几个公共 STUN 提高打洞成功率
+        const ICE_SERVERS = [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun.cloudflare.com:3478' },
+            { urls: 'stun:stun.twilio.com:3478' },
+        ];
+
+        // ============ 全局状态 ============
         let peer = null;
-        let conn = null;
+        let conns = [];
         let currentRoomId = null;
         let isHost = false;
+        let connectedCount = 0;
+        let connectTimer = null;
 
-        // DOM 元素
+        // ============ DOM ============
         const statusBadge = document.getElementById('statusBadge');
+        const connInfo = document.getElementById('connInfo');
         const createRoomBtn = document.getElementById('createRoomBtn');
         const roomIdContainer = document.getElementById('roomIdContainer');
         const roomIdInput = document.getElementById('roomIdInput');
@@ -135,7 +143,6 @@
         const receivedList = document.getElementById('receivedList');
         const emptyReceived = document.getElementById('emptyReceived');
 
-        // 更新连接状态
         function updateStatus(connected) {
             if (connected) {
                 statusBadge.innerHTML = '<i class="fa fa-check-circle mr-1"></i>已连接';
@@ -146,37 +153,41 @@
             }
         }
 
-        // 生成随机房间号
+        function showConnInfo(text, isWarn) {
+            connInfo.classList.remove('hidden');
+            connInfo.textContent = text;
+            connInfo.className = 'text-sm mb-3 ' + (isWarn ? 'text-warning' : 'text-gray-500');
+        }
+
         function generateRoomId() {
             return Math.random().toString(36).substring(2, 8).toUpperCase();
         }
 
-        // 创建房间
+        function clearConnectTimer() {
+            if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+        }
+
+        // ============ 创建房间（接收方） ============
         createRoomBtn.addEventListener('click', () => {
             const roomId = generateRoomId();
             isHost = true;
             currentRoomId = roomId;
-            
-            peer = new Peer(roomId, {
-                debug: 2,
-                config: {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' }
-                    ]
-                }
-            });
+            connectedCount = 0;
+            conns = [];
+
+            peer = new Peer(roomId, { debug: 1, config: { iceServers: ICE_SERVERS } });
 
             peer.on('open', (id) => {
                 roomIdInput.value = id;
                 roomIdContainer.classList.remove('hidden');
                 createRoomBtn.disabled = true;
                 createRoomBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                showConnInfo('等待对方加入…');
             });
 
             peer.on('connection', (connection) => {
-                conn = connection;
-                setupConnection();
+                conns.push(connection);
+                setupReceiveConnection(connection);
             });
 
             peer.on('error', (err) => {
@@ -185,32 +196,33 @@
             });
         });
 
-        // 加入房间
+        // ============ 加入房间（发送方，建多条连接） ============
         joinRoomBtn.addEventListener('click', () => {
             const roomId = joinRoomInput.value.trim().toUpperCase();
-            if (!roomId) {
-                alert('请输入房间号');
-                return;
-            }
+            if (!roomId) { alert('请输入房间号'); return; }
 
             isHost = false;
             currentRoomId = roomId;
+            connectedCount = 0;
+            conns = [];
 
-            peer = new Peer({
-                debug: 2,
-                config: {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' }
-                    ]
-                }
-            });
+            peer = new Peer({ debug: 1, config: { iceServers: ICE_SERVERS } });
 
             peer.on('open', () => {
-                conn = peer.connect(roomId, {
-                    reliable: true
-                });
-                setupConnection();
+                showConnInfo('正在打洞建立直连…');
+                for (let i = 0; i < PARALLEL_CONNS; i++) {
+                    const conn = peer.connect(roomId, { reliable: true, serialization: 'binary' });
+                    conns.push(conn);
+                    setupSendConnection(conn, i);
+                }
+                connectTimer = setTimeout(() => {
+                    const openCount = conns.filter(c => c.open).length;
+                    if (openCount === 0) {
+                        showConnInfo('本次直连失败：15 秒内没有通道建立。跨国直连依赖双方 NAT 类型，建议换网络（如手机热点）或重试。', true);
+                    } else {
+                        showConnInfo(`仅 ${openCount}/${PARALLEL_CONNS} 条通道建立，直连质量可能较差。`, true);
+                    }
+                }, CONNECT_TIMEOUT);
             });
 
             peer.on('error', (err) => {
@@ -219,32 +231,68 @@
             });
         });
 
-        // 设置连接
-        function setupConnection() {
+        // ============ 发送方连接初始化 ============
+        function setupSendConnection(conn, idx) {
             conn.on('open', () => {
-                updateStatus(true);
-                alert('连接成功！现在可以开始传输文件了');
+                connectedCount++;
+                clearConnectTimer();
+                const openCount = conns.filter(c => c.open).length;
+                showConnInfo(`已建立 ${openCount}/${PARALLEL_CONNS} 条直连通道`);
+                if (connectedCount >= 1) updateStatus(true);
+                // 建连后测一次 RTT，粗略反映链路质量
+                probeRTT(conn, idx);
             });
-
-            conn.on('data', (data) => {
-                handleReceivedData(data);
-            });
-
             conn.on('close', () => {
-                updateStatus(false);
-                alert('连接已断开');
-                resetConnection();
+                connectedCount = Math.max(0, connectedCount - 1);
+                if (connectedCount === 0) { updateStatus(false); resetConnection(); }
+                else showConnInfo(`部分通道断开，剩余 ${conns.filter(c => c.open).length} 条`, true);
+            });
+            conn.on('error', (e) => console.warn('conn error', idx, e));
+            conn.on('data', (data) => {
+                // 接收方回传的 pong
+                if (data && data.type === 'pong') {
+                    const rtt = Date.now() - data.t;
+                    const openCount = conns.filter(c => c.open).length;
+                    showConnInfo(`已建立 ${openCount}/${PARALLEL_CONNS} 条直连通道 · 通道${idx} RTT ${rtt}ms`);
+                }
             });
         }
 
-        // 重置连接
+        function probeRTT(conn, idx) {
+            if (!conn.open) return;
+            try {
+                conn.send({ type: 'ping', t: Date.now(), idx });
+            } catch (e) { /* ignore */ }
+        }
+
+        // ============ 接收方连接初始化 ============
+        function setupReceiveConnection(conn) {
+            conn.on('open', () => {
+                updateStatus(true);
+                showConnInfo('对方已连接，等待传输');
+            });
+            conn.on('data', (data) => {
+                if (data && data.type === 'ping') {
+                    try { conn.send({ type: 'pong', t: data.t, idx: data.idx }); } catch (e) {}
+                    return;
+                }
+                handleReceivedData(data, conn);
+            });
+            conn.on('close', () => {
+                if (conns.every(c => !c.open)) updateStatus(false);
+            });
+        }
+
         function resetConnection() {
+            clearConnectTimer();
             if (peer) peer.destroy();
             peer = null;
-            conn = null;
+            conns = [];
             currentRoomId = null;
             isHost = false;
+            connectedCount = 0;
             updateStatus(false);
+            connInfo.classList.add('hidden');
             createRoomBtn.disabled = false;
             createRoomBtn.classList.remove('opacity-50', 'cursor-not-allowed');
             roomIdContainer.classList.add('hidden');
@@ -252,168 +300,245 @@
             joinRoomInput.value = '';
         }
 
-        // 复制房间号
         copyRoomBtn.addEventListener('click', () => {
             roomIdInput.select();
             document.execCommand('copy');
             alert('房间号已复制到剪贴板');
         });
 
-        // 文件选择
+        // ============ 文件选择 / 拖拽 ============
         dropArea.addEventListener('click', () => fileInput.click());
         fileInput.addEventListener('change', (e) => {
             sendFiles(e.target.files);
             fileInput.value = '';
         });
 
-        // 拖拽事件
         ['dragenter', 'dragover'].forEach(eventName => {
             dropArea.addEventListener(eventName, (e) => {
-                e.preventDefault();
-                e.stopPropagation();
+                e.preventDefault(); e.stopPropagation();
                 dropArea.classList.add('drop-area-active');
             });
         });
-
         ['dragleave', 'drop'].forEach(eventName => {
             dropArea.addEventListener(eventName, (e) => {
-                e.preventDefault();
-                e.stopPropagation();
+                e.preventDefault(); e.stopPropagation();
                 dropArea.classList.remove('drop-area-active');
             });
         });
+        dropArea.addEventListener('drop', (e) => sendFiles(e.dataTransfer.files));
 
-        dropArea.addEventListener('drop', (e) => {
-            const files = e.dataTransfer.files;
-            sendFiles(files);
-        });
+        // ============ 背压发送 ============
+        function makeConnectionSender(conn) {
+            const queue = [];
+            let sending = false;
+            return {
+                enqueue(task) {
+                    queue.push(task);
+                    if (sending) return;
+                    sending = true;
+                    (function step() {
+                        if (queue.length === 0) { sending = false; return; }
+                        const dc = conn.dataChannel;
+                        if (!dc) { setTimeout(step, 10); return; }
+                        if (dc.bufferedAmount > BUFFER_HIGH) { setTimeout(step, 10); return; }
+                        const t = queue.shift();
+                        t();
+                        if (dc.bufferedAmount > BUFFER_LOW) setTimeout(step, 5);
+                        else step();
+                    })();
+                }
+            };
+        }
 
-        // 发送文件
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+            return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+        }
+
+        // ============ 发送文件（多连接并行 + 存活通道动态分配） ============
         function sendFiles(files) {
-            if (!conn || !conn.open) {
+            const openConns = conns.filter(c => c.open);
+            if (openConns.length === 0) {
                 alert('请先连接到对方设备');
                 return;
             }
 
             Array.from(files).forEach(file => {
-                // 创建传输任务UI
-                const transferItem = document.createElement('div');
-                transferItem.className = 'border border-gray-200 rounded-lg p-3';
-                transferItem.innerHTML = `
+                const transferId = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+                const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+                const item = document.createElement('div');
+                item.className = 'border border-gray-200 rounded-lg p-3';
+                item.innerHTML = `
                     <div class="flex items-center justify-between mb-2">
-                        <p class="text-gray-800 font-medium truncate">${file.name}</p>
-                        <span class="text-sm text-gray-500 sending-status">准备发送...</span>
+                        <p class="text-gray-800 font-medium truncate">${file.name} <span class="text-xs text-gray-400">(${formatSize(file.size)})</span></p>
+                        <span class="text-sm text-gray-500 status">准备发送...</span>
                     </div>
                     <div class="w-full bg-gray-200 rounded-full h-2">
-                        <div class="bg-primary h-2 rounded-full progress-bar" style="width: 0%"></div>
+                        <div class="bg-primary h-2 rounded-full bar" style="width: 0%"></div>
                     </div>
+                    <div class="text-xs text-gray-400 mt-1 speed"></div>
                 `;
-                transferList.insertBefore(transferItem, emptyTransfer);
+                transferList.insertBefore(item, emptyTransfer);
                 emptyTransfer.classList.add('hidden');
 
-                // 分块发送文件
-                const chunkSize = 16 * 1024; // 16KB 每块
-                let offset = 0;
-                const totalChunks = Math.ceil(file.size / chunkSize);
-                let currentChunk = 0;
+                const statusEl = item.querySelector('.status');
+                const barEl = item.querySelector('.bar');
+                const speedEl = item.querySelector('.speed');
 
-                // 发送文件元信息
-                conn.send({
-                    type: 'file-meta',
-                    name: file.name,
-                    size: file.size,
-                    totalChunks: totalChunks
+                // 先发 meta
+                openConns[0].send({
+                    type: 'file-meta', transferId, name: file.name,
+                    size: file.size, totalChunks, chunkSize: CHUNK_SIZE
                 });
 
-                function sendNextChunk() {
-                    if (offset >= file.size) {
-                        transferItem.querySelector('.sending-status').textContent = '发送完成';
-                        transferItem.querySelector('.progress-bar').style.width = '100%';
+                let sentChunks = 0;
+                let sentBytes = 0;
+                let startTime = Date.now();
+                let lastTime = startTime, lastBytes = 0;
+
+                // 为每条连接建 sender（按当前 open 的连接）
+                const senderMap = new Map();
+                openConns.forEach(c => senderMap.set(c, makeConnectionSender(c)));
+
+                let nextIndex = 0;
+
+                function pickAliveConn() {
+                    // 优先选当前仍 open 的连接
+                    const alive = openConns.filter(c => c.open);
+                    if (alive.length === 0) return null;
+                    return alive[nextIndex % alive.length];
+                }
+
+                function dispatchNext() {
+                    if (sentChunks >= totalChunks) return;
+
+                    // 若所有通道都断了，终止
+                    if (openConns.every(c => !c.open)) {
+                        statusEl.textContent = '发送中断：连接已断开';
                         return;
                     }
 
-                    const chunk = file.slice(offset, offset + chunkSize);
-                    chunk.arrayBuffer().then(buffer => {
-                        conn.send({
-                            type: 'file-chunk',
-                            chunk: buffer,
-                            index: currentChunk
-                        });
-                        
-                        currentChunk++;
-                        offset += chunkSize;
-                        const progress = (currentChunk / totalChunks) * 100;
-                        transferItem.querySelector('.progress-bar').style.width = progress + '%';
-                        transferItem.querySelector('.sending-status').textContent = `发送中 ${Math.round(progress)}%`;
-                        
-                        setTimeout(sendNextChunk, 10);
-                    });
-                }
+                    const index = nextIndex++;
+                    // 找一个存活通道
+                    const alive = openConns.filter(c => c.open);
+                    const conn = alive[index % alive.length];
+                    const sender = senderMap.get(conn);
+                    const offset = index * CHUNK_SIZE;
+                    const chunk = file.slice(offset, offset + CHUNK_SIZE);
 
-                sendNextChunk();
+                    sender.enqueue(() => {
+                        if (!conn.open) {
+                            // 该通道已断，把这块重新排到队列（简单重试一次）
+                            nextIndex = Math.min(nextIndex, index);
+                            setTimeout(dispatchNext, 20);
+                            return;
+                        }
+                        chunk.arrayBuffer().then(buffer => {
+                            try {
+                                conn.send({ type: 'file-chunk', transferId, index, chunk: buffer });
+                            } catch (e) {
+                                // 发送失败，简单重试
+                                setTimeout(dispatchNext, 50);
+                                return;
+                            }
+                            sentChunks++;
+                            sentBytes += buffer.byteLength;
+                            const now = Date.now();
+                            if (now - lastTime >= 500) {
+                                const instSpeed = (sentBytes - lastBytes) / ((now - lastTime) / 1000);
+                                const avgSpeed = sentBytes / ((now - startTime) / 1000);
+                                speedEl.textContent = `速度 ${(instSpeed/1024/1024).toFixed(2)} MB/s（平均 ${(avgSpeed/1024/1024).toFixed(2)} MB/s） · ${formatSize(sentBytes)} / ${formatSize(file.size)}`;
+                                lastTime = now; lastBytes = sentBytes;
+                            }
+                            const progress = (sentChunks / totalChunks) * 100;
+                            barEl.style.width = progress + '%';
+                            statusEl.textContent = `发送中 ${Math.round(progress)}%`;
+                            if (sentChunks === totalChunks) {
+                                statusEl.textContent = '发送完成';
+                                barEl.style.width = '100%';
+                                const totalSec = (Date.now() - startTime) / 1000;
+                                speedEl.textContent = `完成，用时 ${totalSec.toFixed(1)}s，平均 ${(file.size/1024/1024/totalSec).toFixed(2)} MB/s`;
+                            }
+                        });
+                    });
+
+                    if (nextIndex < totalChunks) setTimeout(dispatchNext, 0);
+                }
+                dispatchNext();
             });
         }
 
-        // 接收数据处理
+        // ============ 接收端 ============
         const receivedFiles = {};
+
         function handleReceivedData(data) {
             if (data.type === 'file-meta') {
-                // 初始化接收
-                const fileId = Date.now() + '_' + data.name;
-                receivedFiles[fileId] = {
-                    name: data.name,
-                    size: data.size,
-                    totalChunks: data.totalChunks,
-                    chunks: []
+                const { transferId, name, size, totalChunks } = data;
+                if (receivedFiles[transferId]) return;
+                receivedFiles[transferId] = {
+                    name, size, totalChunks,
+                    chunks: new Array(totalChunks),
+                    received: 0, done: false,
+                    startTime: Date.now(), lastTime: Date.now(), lastBytes: 0, receivedBytes: 0
                 };
 
-                // 创建接收UI
-                const receiveItem = document.createElement('div');
-                receiveItem.className = 'border border-gray-200 rounded-lg p-3';
-                receiveItem.id = 'receive_' + fileId;
-                receiveItem.innerHTML = `
+                const el = document.createElement('div');
+                el.className = 'border border-gray-200 rounded-lg p-3';
+                el.id = 'receive_' + transferId;
+                el.innerHTML = `
                     <div class="flex items-center justify-between mb-2">
-                        <p class="text-gray-800 font-medium truncate">${data.name}</p>
-                        <span class="text-sm text-gray-500 receiving-status">接收中 0%</span>
+                        <p class="text-gray-800 font-medium truncate">${name} <span class="text-xs text-gray-400">(${formatSize(size)})</span></p>
+                        <span class="text-sm text-gray-500 status">接收中 0%</span>
                     </div>
                     <div class="w-full bg-gray-200 rounded-full h-2">
-                        <div class="bg-success h-2 rounded-full progress-bar" style="width: 0%"></div>
+                        <div class="bg-success h-2 rounded-full bar" style="width: 0%"></div>
                     </div>
+                    <div class="text-xs text-gray-400 mt-1 speed"></div>
                 `;
-                receivedList.insertBefore(receiveItem, emptyReceived);
+                receivedList.insertBefore(el, emptyReceived);
                 emptyReceived.classList.add('hidden');
             } else if (data.type === 'file-chunk') {
-                // 接收分块
-                const fileId = Object.keys(receivedFiles).find(id => 
-                    receivedFiles[id].chunks.length === data.index
-                );
-                if (!fileId) return;
+                const f = receivedFiles[data.transferId];
+                if (!f || f.done) return;
+                if (f.chunks[data.index]) return;
+                f.chunks[data.index] = data.chunk;
+                f.received++;
+                f.receivedBytes += data.chunk.byteLength || 0;
 
-                receivedFiles[fileId].chunks.push(data.chunk);
-                const progress = (receivedFiles[fileId].chunks.length / receivedFiles[fileId].totalChunks) * 100;
-                
-                const receiveItem = document.getElementById('receive_' + fileId);
-                receiveItem.querySelector('.progress-bar').style.width = progress + '%';
-                receiveItem.querySelector('.receiving-status').textContent = `接收中 ${Math.round(progress)}%`;
+                const el = document.getElementById('receive_' + data.transferId);
+                if (!el) return;
+                const progress = (f.received / f.totalChunks) * 100;
+                el.querySelector('.bar').style.width = progress + '%';
+                el.querySelector('.status').textContent = `接收中 ${Math.round(progress)}%`;
 
-                // 接收完成
-                if (receivedFiles[fileId].chunks.length === receivedFiles[fileId].totalChunks) {
-                    const fileData = receivedFiles[fileId];
-                    const blob = new Blob(fileData.chunks);
+                const now = Date.now();
+                if (now - f.lastTime >= 500) {
+                    const instSpeed = (f.receivedBytes - f.lastBytes) / ((now - f.lastTime) / 1000);
+                    const avgSpeed = f.receivedBytes / ((now - f.startTime) / 1000);
+                    el.querySelector('.speed').textContent = `速度 ${(instSpeed/1024/1024).toFixed(2)} MB/s（平均 ${(avgSpeed/1024/1024).toFixed(2)} MB/s） · ${formatSize(f.receivedBytes)} / ${formatSize(f.size)}`;
+                    f.lastTime = now; f.lastBytes = f.receivedBytes;
+                }
+
+                if (f.received === f.totalChunks) {
+                    f.done = true;
+                    const blob = new Blob(f.chunks);
                     const url = URL.createObjectURL(blob);
-                    
-                    receiveItem.querySelector('.receiving-status').textContent = '接收完成';
-                    receiveItem.innerHTML += `
-                        <a href="${url}" download="${fileData.name}" class="mt-2 inline-block bg-success hover:bg-success/90 text-white px-4 py-1 rounded-lg text-sm transition-all">
-                            <i class="fa fa-download mr-1"></i>下载文件
-                        </a>
-                    `;
-                    delete receivedFiles[fileId];
+                    el.querySelector('.status').textContent = '接收完成';
+                    const totalSec = (Date.now() - f.startTime) / 1000;
+                    el.querySelector('.speed').textContent = `完成，用时 ${totalSec.toFixed(1)}s，平均 ${(f.size/1024/1024/totalSec).toFixed(2)} MB/s`;
+                    const a = document.createElement('a');
+                    a.href = url; a.download = f.name;
+                    a.className = 'mt-2 inline-block bg-success hover:bg-success/90 text-white px-4 py-1 rounded-lg text-sm transition-all';
+                    a.innerHTML = '<i class="fa fa-download mr-1"></i>下载文件';
+                    el.appendChild(a);
+                    delete receivedFiles[data.transferId];
                 }
             }
         }
 
-        // 初始化
         updateStatus(false);
     </script>
 </body>
